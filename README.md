@@ -1,3 +1,291 @@
+# AAIE: Adversarial AI Engine
+
+> **Reference implementation for:**
+> *"Beyond the Efficiency-Efficacy Dilemma: A Critical Analysis of Transferability in Adversarial Malware Detection"*
+> **IEEE RTSI 2026** — Track 4: Digitalisation, ICT, Cybersecurity and Resilient Operation of Energy Infrastructures (https://2026.ieee-rtsi.org/)
+
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.1.0-orange.svg)](https://pytorch.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Conference](https://img.shields.io/badge/RTSI-2026-red.svg)](https://rtsi2026.ieee.it)
+
+---
+
+## Overview
+
+AAIE is a modular, automated framework for adversarial robustness testing of machine learning-based security classifiers. It implements a surrogate-based black-box transfer attack pipeline: adversarial examples are crafted against a differentiable surrogate model and transferred to an opaque target classifier, emulating realistic threat scenarios where the attacker has no direct access to the production system.
+
+The core finding this implementation validates: **single-step FGSM achieves higher cross-architecture transferability than iterative PGD** when attacking a Random Forest target via a neural network surrogate — a counterintuitive result with direct implications for scalable adversarial stress-testing of deployed ML detectors.
+
+---
+
+## Repository Structure
+
+```
+AAIE/
+├── AAIE_experiment.ipynb       # Main experiment notebook (Colab-ready)
+├── README.md                   # This file
+├── requirements.txt            # Dependencies
+├── paper/
+│   └── RTSI2026_AAIE.pdf       # Conference paper (added after publication)
+└── figs/                       # Generated result figures
+    ├── attack_success_rate.png
+    ├── transferability_gap_comparison.png
+    └── der_ri_combined.png
+```
+
+---
+
+## System Architecture
+
+AAIE implements a seven-component pipeline design:
+
+| Module | Acronym | Function |
+|--------|---------|----------|
+| Input & Context Module | MICo | Collects input data and experiment metadata for reproducibility |
+| Attack Specification Module | ASM | Translates a security goal into algorithmic attack specifications |
+| Attack Generator | ATGen | Composes gradient-based attacks (FGSM, PGD) and transfer-based variants |
+| Transfer Module | TM | Trains surrogate, applies white-box attacks, evaluates transferability against black-box target |
+| Orchestrator | — | Initializes, schedules, and terminates experiments |
+| Evaluation & Scoring Module | ESM | Computes ASR, Transferability Score, DER, and Resilience Index |
+| Provenance Layer | PAL | Logs all parameters, seeds, and results for audit and reproducibility |
+
+The **Transfer Module** is the focus of this study. It operates as follows:
+
+```
+EMBER2018 features
+      │
+      ▼
+┌─────────────────┐     pseudo-labels      ┌──────────────────┐
+│  Target Model   │ ──────────────────────▶ │  Surrogate Model │
+│  (Random Forest)│                         │  (Neural Network)│
+└─────────────────┘                         └────────┬─────────┘
+                                                     │
+                                            FGSM / PGD attack
+                                                     │
+                                                     ▼
+                                         adversarial examples x_adv
+                                                     │
+                                            transfer to target
+                                                     │
+                                                     ▼
+                                            ASR / TS / DER / RI
+```
+
+---
+
+## Dataset
+
+**EMBER2018** — Elastic Malware Benchmark for Empowering Researchers
+
+| Property | Value |
+|----------|-------|
+| Source | Anderson & Roth (2018), arXiv:1804.04637 |
+| Format | Static Portable Executable (PE) features (JSONL) |
+| Original size | ~1M samples |
+| This study (stratified subset) | 9,693 train / 1,195 test |
+| Class balance | ~50% benign / 50% malicious |
+
+**Download:** https://github.com/elastic/ember
+
+AAIE extracts a 30-dimensional feature vector from each sample across six static PE categories:
+
+| Category | Features | Count |
+|----------|----------|-------|
+| Byte histogram statistics | mean, std, max, min, median, fraction-above-mean | 6 |
+| Byte entropy statistics | mean, std, max, high-entropy fraction | 4 |
+| String characteristics | count, average length, printable ratio | 3 |
+| General file metadata | size, virtual size, debug/relocation/resource/signature/TLS flags, export/import counts, symbol count | 10 |
+| PE header fields | subsystem type, COFF timestamp | 2 |
+| Structural counts | section count, data directory count, DLL import count, export count | 4 |
+| Padding | — | 1 |
+| **Total** | | **30** |
+
+All features are normalized with `sklearn.preprocessing.StandardScaler` (fit on training data only).
+
+---
+
+## Models
+
+### Target Model — Random Forest Classifier
+Emulates production-grade ML malware detectors commonly deployed in endpoint security products.
+
+| Hyperparameter | Value |
+|----------------|-------|
+| n_estimators | 200 |
+| max_depth | 15 |
+| class_weight | balanced |
+| random_state | 42 |
+
+### Surrogate Model — Neural Network
+Trained via pseudo-labeling (target RF predictions as labels) to approximate the target's decision boundary without direct access to its parameters.
+
+| Component | Specification |
+|-----------|---------------|
+| Architecture | Fully-connected: 30 → 64 → 32 → 2 |
+| Activations | ReLU (hidden), Softmax (output) |
+| Loss | Cross-entropy |
+| Optimizer | Adam (lr=1e-3, weight_decay=1e-4) |
+| Training | Full-batch, deterministic |
+
+---
+
+## Adversarial Attacks
+
+Both attacks are applied in feature space on the surrogate, then transferred to the target RF.
+
+### FGSM (Fast Gradient Sign Method)
+Single-step attack (Goodfellow et al., ICLR 2015):
+
+$$\delta = \varepsilon \cdot \text{sign}(\nabla_x \mathcal{L}(f_\theta(x), y))$$
+
+### PGD (Projected Gradient Descent)
+Iterative attack (Madry et al., ICLR 2018), 10 steps, step size α = ε/4:
+
+$$x^{(t+1)} = \text{Proj}_{x+\mathcal{S}}\left(x^{(t)} + \alpha \cdot \text{sign}(\nabla_x \mathcal{L}(f_\theta(x^{(t)}), y))\right)$$
+
+**Perturbation budgets evaluated:**
+`ε ∈ {0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20}` (L∞ norm)
+
+---
+
+## Evaluation Metrics
+
+| Metric | Symbol | Description |
+|--------|--------|-------------|
+| Attack Success Rate | ASR | Fraction of adversarial examples that cause misclassification |
+| Transferability Score | TS = ASR_target / ASR_surrogate | Cross-model attack effectiveness; TS > 1 means target is more vulnerable than surrogate |
+| Detection Evasion Ratio | DER = 100 × (DR_adv − DR_clean) | Stealth against secondary OC-SVM anomaly detector; negative = better evasion |
+| Resilience Index | RI ∈ [0,100] | Composite metric: 0.4 × accuracy preservation + 0.4 × attack resistance + 0.2 × stealth |
+
+---
+
+## Results
+
+### Key Finding
+
+> **FGSM (single-step) achieves higher transferability than PGD (iterative) when attacking a Random Forest via a neural network surrogate.**
+
+This is statistically significant: paired t-test t = 5.234, **p = 0.00112**, Cohen's d = 0.742.
+
+### Attack Success Rate
+
+| ε | FGSM ASR | PGD ASR | FGSM Advantage |
+|---|----------|---------|----------------|
+| 0.050 | 0.321 | 0.278 | +13.5% |
+| 0.100 | 0.454 | 0.362 | +20.3% |
+| **0.150** | **0.529** | **0.437** | **+17.4%** |
+| 0.200 | 0.527 | 0.452 | +14.3% |
+
+### Transferability Score
+
+FGSM achieves **TS = 0.802** at ε = 0.15, with **19.4% higher average TS** than PGD across all budgets.
+
+### Resilience Index at ε = 0.15
+
+| Condition | RI |
+|-----------|-----|
+| Clean (no attack) | 100.0 |
+| Under FGSM | 54.99 |
+| Under PGD | 49.76 |
+
+Both fall in the **moderate resilience** range (33–66), indicating that current ML malware detectors remain meaningfully vulnerable to transfer attacks.
+
+### Why Does FGSM Transfer Better?
+
+PGD iteratively ascends the surrogate's loss landscape, overfitting to the neural network's local curvature and non-linear decision boundary geometry. When transferred to a Random Forest — whose tree-based partitioning creates fundamentally different decision boundaries — these overfit perturbations fail.
+
+FGSM's single gradient step produces a coarser perturbation that aligns with generalizable vulnerability directions shared across model families, consistent with recent theoretical work on feature-level transferability (Li et al., 2025; Zheng et al., 2025).
+
+---
+
+## Requirements
+
+```txt
+torch==2.1.0
+scikit-learn==1.3.0
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+```
+
+Install:
+```bash
+pip install -r requirements.txt
+```
+
+Or in Colab (GPU recommended):
+```bash
+!pip install torch scikit-learn numpy pandas matplotlib seaborn scipy
+```
+
+---
+
+## Quickstart
+
+1. Download EMBER2018: https://github.com/elastic/ember
+2. Place `train_features_*.jsonl` and `test_features.jsonl` in `/content/`
+3. Open `AAIE_experiment.ipynb` in Google Colab
+4. Run all cells — full experiment completes in **< 15 minutes** on T4 GPU
+
+---
+
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@inproceedings{alevcan2026aaie,
+  author    = {Alevcan, Veysel and Ali, Mohammad Furqan and 
+               Sousa, Teresa and Campos, Lu{\'i}s Miguel and 
+               Ntantogian, Christoforos},
+  title     = {Beyond the Efficiency-Efficacy Dilemma: A Critical 
+               Analysis of Transferability in Adversarial Malware 
+               Detection},
+  booktitle = {Proceedings of the IEEE International Conference on 
+               Environment and Electrical Engineering (RTSI)},
+  year      = {2026},
+  note      = {Track 4: Cybersecurity for Energy Infrastructures}
+}
+```
+
+> 📄 **Paper PDF** will be added to `paper/` after publication.
+
+---
+
+## Funding
+
+This work was funded by the European Union under Grant Agreements:
+- **No. 101131292** — AIAS
+- **No. 101183162** — ANTIDOTE
+- **No. 101145872** — NITRO
+- **No. 101168490** — RECITALS
+
+NITRO and RECITALS are supported by the European Cybersecurity Competence Centre (ECCC).
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+## Authors
+
+| Name | Affiliation |
+|------|-------------|
+| Veysel Alevcan | COPELABS, Lusófona University & PDMFC SA, Lisbon |
+| Mohammad Furqan Ali | COPELABS, Lusófona University, Lisbon |
+| Teresa Sousa | PDMFC SA, Lisbon |
+| Luís Miguel Campos | COPELABS, Lusófona University, Lisbon |
+| Christoforos Ntantogian | Dept. of Informatics, Ionian University, Corfu |
+
+
+
+
 # Cybersecurity datasets
 
 Attackers demonstrate the performance of their adversarial attacks based on different datasets and victim models. This brings obstacles to objectively evaluating the adversarial attacks and measuring the robustness of deep learning models. In particular, large and high-quality datasets usually make it hard for adversaries/defenders to attack/defend. In this subsection, we provide an overview of the most prominent datasets employed in building DL-based defense systems and using adversarial machine learning approaches in the cybersecurity domain, organized per specific application/category. Herein, we can find a curated list of cybersecurity datasets.
